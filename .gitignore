@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Large binary files — PDFs and EPUBs live on disk, not in git
+books to convert/*.pdf
+books to convert/*.epub
+books to convert/*.html
+books to convert/*.png
+books to convert/*.jpg
+books to convert/*.jpeg
+Processed PDFs to EPUB/
+
+# Virtualenv
+pdf_env/
