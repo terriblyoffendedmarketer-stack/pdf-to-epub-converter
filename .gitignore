@@ -10,6 +10,8 @@ books to convert/*.png
 books to convert/*.jpg
 books to convert/*.jpeg
 Processed PDFs to EPUB/
+books to convert/*_images/
 
 # Virtualenv
 pdf_env/
+books to convert/pdf_env/

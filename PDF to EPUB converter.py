@@ -1092,7 +1092,7 @@ def process_file(pdf_path, output_dir=None):
             return filename, category, "FAILED", msg
 
         print(f"  -> {epub_path}")
-        return filename, category, "SUCCESS", ""
+        return filename, category, "SUCCESS", "", title, author, epub_path
 
     except Exception as e:
         msg = str(e)
@@ -1139,3 +1139,51 @@ if __name__ == "__main__":
         icon = {"SUCCESS": "+", "FAILED": "X", "SKIPPED": "-"}.get(status, "?")
         print(f"[{icon}] {status:<8} | {category:<12} | {filename}")
     print("=" * 80 + "\n")
+
+    # Non-blocking author metadata prompt
+    missing_author = []
+    for r in results:
+        if len(r) >= 7:
+            filename, category, status, msg, title, author, epub_path = r
+            if status == "SUCCESS" and not author:
+                missing_author.append((title, epub_path))
+
+    if missing_author:
+        print(f"{len(missing_author)} book(s) have no author metadata:")
+        for i, (t, ep) in enumerate(missing_author, 1):
+            print(f"  {i}. {t}")
+        print()
+        try:
+            ans = input("Enter author names? (y to fill in, Enter to skip): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans == "y":
+            for i, (t, ep) in enumerate(missing_author, 1):
+                try:
+                    name = input(f"  Author for '{t}': ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    name = ""
+                if name:
+                    html_path = ep.replace(".epub", ".html")
+                    base_dir = os.path.dirname(html_path)
+                    cmd = [
+                        "pandoc", os.path.basename(html_path),
+                        "-o", ep,
+                        "--metadata", f"title={t}",
+                        "--metadata", f"creator={name}",
+                        f"--resource-path={base_dir}",
+                    ]
+                    cover_candidates = [
+                        os.path.join(base_dir, os.path.splitext(os.path.basename(ep))[0] + "_images", "cover.png"),
+                        os.path.join(base_dir, os.path.splitext(os.path.basename(ep))[0] + "_images", "cover.jpg"),
+                    ]
+                    for cc in cover_candidates:
+                        if os.path.exists(cc):
+                            cmd.append(f"--epub-cover-image={os.path.relpath(cc, base_dir)}")
+                            break
+                    result = subprocess.run(cmd, cwd=base_dir, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        print(f"    Updated: {os.path.basename(ep)}")
+                    else:
+                        print(f"    Failed to update: {result.stderr.strip()}")
+            print()
