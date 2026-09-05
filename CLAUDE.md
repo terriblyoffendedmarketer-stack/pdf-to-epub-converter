@@ -30,7 +30,7 @@
 - [x] Table detection and formatting (multi-column data → HTML tables)
 - [x] Two-tier span merge (per-word spacing fix without breaking per-char merge)
 - [x] Battle-tested on 25 diverse PDFs (20 PASS, 5 WARN, 0 FAIL)
-- [ ] Web portal for upload/convert/download
+- [x] Web portal for upload/convert/download
 
 ## File Map
 - `PDF to EPUB converter.py` — Main converter script. Run with: `python3 "PDF to EPUB converter.py" <dir-or-file> [-y] [-o output_dir]`
@@ -39,12 +39,15 @@
 - `books to convert/` — Source PDFs, intermediate HTML, extracted images, and generated EPUBs
 - `books to convert/batch_converter_master.py` — Copy of main converter (kept in sync)
 - `Processed PDFs to EPUB/` — Final verified EPUB output (25 books)
+- `web_converter.py` — Flask web portal. Upload PDF, convert, download EPUB. Runs at localhost:5151
+- `Start Converter.command` — Double-click to launch the web portal (macOS)
 
 ## Setup & Run
 1. Requires: Python 3.x with PyMuPDF (`pip install pymupdf`), pandoc
 2. Virtualenv at: `books to convert/pdf_env/`
-3. Convert: `books to convert/pdf_env/bin/python3 "PDF to EPUB converter.py" "books to convert" -y -o "Processed PDFs to EPUB"`
-4. Audit: `books to convert/pdf_env/bin/python3 audit_epubs.py "Processed PDFs to EPUB"`
+3. Web portal: Double-click `Start Converter.command` — opens browser at localhost:5151
+4. CLI convert: `books to convert/pdf_env/bin/python3 "PDF to EPUB converter.py" "books to convert" -y -o "Processed PDFs to EPUB"`
+5. Audit: `books to convert/pdf_env/bin/python3 audit_epubs.py "Processed PDFs to EPUB"`
 
 ## Known Quirks
 - Title extraction priority: page-0 "Title by Author" pattern -> PDF metadata (never filename)

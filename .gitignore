@@ -12,6 +12,10 @@ books to convert/*.jpeg
 Processed PDFs to EPUB/
 books to convert/*_images/
 
+# Web portal temp files
+uploads/
+converted/
+
 # Virtualenv
 pdf_env/
 books to convert/pdf_env/
