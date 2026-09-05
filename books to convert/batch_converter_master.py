@@ -387,6 +387,146 @@ def collapse_spaced_text(text):
     return ' '.join(merged)
 
 
+def _detect_tables_in_page(spans):
+    """Detect tabular regions in a page's spans and replace with table HTML.
+
+    Conservative: requires 3+ consecutive rows where each row has 2+ short
+    text spans at distinct x-positions.  Body text (long spans) is never
+    mistaken for a table.
+    """
+    if not spans:
+        return spans
+
+    text_entries = [(i, s) for i, s in enumerate(spans)
+                    if not s.get("is_image") and s.get("text", "").strip()]
+    if len(text_entries) < 6:
+        return spans
+
+    # Group by y-coordinate (5px tolerance)
+    y_groups = {}
+    for idx, s in text_entries:
+        y_key = round(s["y0"] / 5) * 5
+        y_groups.setdefault(y_key, []).append((idx, s))
+
+    sorted_ys = sorted(y_groups.keys())
+
+    # Find multi-column rows: 2+ SHORT spans with x-spread > 80px
+    # Short = longest span text < 80 chars (tables have brief cells,
+    # body text has long paragraphs)
+    multi_col_ys = []
+    for y_key in sorted_ys:
+        row = y_groups[y_key]
+        if len(row) < 2:
+            continue
+        x0s = [s["x0"] for _, s in row]
+        if max(x0s) - min(x0s) < 80:
+            continue
+        longest = max(len(s["text"].strip()) for _, s in row)
+        if longest > 80:
+            continue
+        multi_col_ys.append(y_key)
+
+    if len(multi_col_ys) < 3:
+        return spans
+
+    # Group consecutive multi-column rows into table regions (require 3+)
+    table_regions = []
+    cur = [multi_col_ys[0]]
+    for i in range(1, len(multi_col_ys)):
+        if multi_col_ys[i] - multi_col_ys[i - 1] < 50:
+            cur.append(multi_col_ys[i])
+        else:
+            if len(cur) >= 3:
+                table_regions.append(cur)
+            cur = [multi_col_ys[i]]
+    if len(cur) >= 3:
+        table_regions.append(cur)
+
+    if not table_regions:
+        return spans
+
+    # Expand each region to include single-column rows in between
+    # (row labels, merged cells) and header rows just above
+    expanded_regions = []
+    for region_ys in table_regions:
+        y_lo, y_hi = region_ys[0], region_ys[-1]
+        region_all_ys = [y for y in sorted_ys if y_lo - 30 <= y <= y_hi + 5]
+        expanded_regions.append(region_all_ys)
+
+    # Build table HTML for each region
+    remove_indices = set()
+    table_inserts = {}
+
+    for region_ys in expanded_regions:
+        rows_data = []
+        first_idx = None
+        for y_key in region_ys:
+            if y_key not in y_groups:
+                continue
+            entries = sorted(y_groups[y_key], key=lambda e: e[1]["x0"])
+            for idx, _ in entries:
+                if first_idx is None:
+                    first_idx = idx
+                remove_indices.add(idx)
+            rows_data.append(entries)
+
+        if not rows_data or first_idx is None:
+            continue
+
+        # Determine column positions from all spans
+        all_x0 = sorted(s["x0"] for row in rows_data for _, s in row)
+        # Cluster x-positions (within 15px)
+        columns = [all_x0[0]]
+        for x in all_x0[1:]:
+            if x - columns[-1] >= 15:
+                columns.append(x)
+        num_cols = len(columns)
+        if num_cols < 2:
+            for row in rows_data:
+                for idx, _ in row:
+                    remove_indices.discard(idx)
+            continue
+
+        tbl = '<table style="width:100%; border-collapse:collapse; margin:1em 0;">'
+        for row in rows_data:
+            cells = [''] * num_cols
+            for _, s in row:
+                best_col, best_d = 0, float('inf')
+                for ci, cx in enumerate(columns):
+                    d = abs(s["x0"] - cx)
+                    if d < best_d:
+                        best_d, best_col = d, ci
+                txt = html_module.escape(s["text"].strip())
+                cells[best_col] = (cells[best_col] + ' ' + txt).strip() if cells[best_col] else txt
+            tbl += '<tr>' + ''.join(
+                f'<td style="padding:2px 8px; vertical-align:top;">{c}</td>' for c in cells
+            ) + '</tr>'
+        tbl += '</table>'
+
+        sample = rows_data[0][0][1]
+        table_inserts[first_idx] = {
+            "is_image": False,
+            "is_table": True,
+            "html": tbl,
+            "text": "",
+            "size": sample.get("size", 10),
+            "x0": sample.get("x0", 0),
+            "y0": sample.get("y0", 0),
+            "y1": sample.get("y1", 0),
+            "page_height": sample.get("page_height", 800),
+            "new_block": True,
+        }
+
+    # Rebuild span list
+    result = []
+    for i, s in enumerate(spans):
+        if i in table_inserts:
+            result.append(table_inserts[i])
+        if i not in remove_indices:
+            result.append(s)
+    return result
+
+
 def extract_spans(doc, pdf_path):
     """Extract text spans and images from every page, preserving block order."""
     pages_spans = []
@@ -462,7 +602,12 @@ def extract_spans(doc, pdf_path):
                             gap = bbox[0] - prev["x1"]
                             avg_sz = (prev["size"] + sz) / 2
                             if gap < avg_sz * 0.6:
-                                prev["text"] += text
+                                # gap > ~15% of font size = word spacing → add space
+                                # gap ≤ ~15% = character-level merge (no space)
+                                if gap > avg_sz * 0.15:
+                                    prev["text"] += " " + text
+                                else:
+                                    prev["text"] += text
                                 prev["x1"] = bbox[2]
                                 prev["y1"] = max(prev["y1"], bbox[3])
                                 continue
@@ -816,6 +961,14 @@ def build_html_layout(pages_spans, header_set, footer_set, heading_map, footnote
         ph = spans[0]["page_height"]
 
         for s in spans:
+            # Pre-built table HTML — output directly
+            if s.get("is_table"):
+                if cur_para:
+                    parts.append("<p>" + strip_marginal_markers(" ".join(cur_para)) + "</p>")
+                    cur_para = []
+                parts.append(s["html"])
+                continue
+
             if s.get("is_image", False):
                 if cur_para:
                     parts.append("<p>" + strip_marginal_markers(" ".join(cur_para)) + "</p>")
@@ -1122,6 +1275,16 @@ def process_file(pdf_path, output_dir=None):
                     if not s.get("is_image") and "text" in s:
                         s["text"] = normalize_ligatures(s["text"], fix_th=fix_th)
                         s["text"] = collapse_spaced_text(s["text"])
+
+            # Detect and format tabular regions before building HTML
+            table_count = 0
+            for pi in range(len(pages_spans)):
+                before = len(pages_spans[pi])
+                pages_spans[pi] = _detect_tables_in_page(pages_spans[pi])
+                if len(pages_spans[pi]) != before:
+                    table_count += 1
+            if table_count:
+                print(f"  Tables detected on {table_count} page(s)")
 
             header_set, footer_set = detect_headers_footers(pages_spans)
             body_size, heading_map = classify_heading_sizes(pages_spans)

@@ -11,6 +11,7 @@ A robust, battle-tested Python tool that converts text-based PDFs to well-struct
 - **Ligature decomposition** — Handles Unicode ligatures (NFKC) and font-specific ligatures (ACaslonPro Th-ligature)
 - **Footnote handling** — Buffered footnote extraction preserves multi-word footnotes as single paragraphs
 - **TOC linking** — Printed table of contents entries become clickable links to chapter headings
+- **Table detection** — Conservative multi-column detection converts tabular data to proper HTML tables
 - **Batch conversion** — Process entire directories with summary report
 - **Quality audit** — Included audit script checks mid-sentence breaks, metadata, structure, and more
 - **Non-blocking metadata prompt** — After batch conversion, optionally fill in missing author names
@@ -49,15 +50,16 @@ python3 audit_epubs.py path/to/epub/directory
 3. **Header/Footer Detection** — Statistical analysis removes repeated page elements
 4. **Heading Classification** — Font-size histogram identifies chapter headings
 5. **Paragraph Merging** — Three layers (within-page, cross-page, HTML post-processing)
-6. **Footnote Buffering** — Spans in bottom 15% of page grouped into footnote paragraphs
-7. **HTML Assembly** — Structured HTML with sections, headings, images, footnotes
-8. **TOC Linking** — Printed TOC entries linked to actual chapter headings
-9. **Cover Generation** — Best available cover from PDF content or generated design
-10. **EPUB Assembly** — Pandoc converts HTML to EPUB with metadata and cover
+6. **Table Detection** — Conservative multi-column detection builds HTML tables from positional spans
+7. **Footnote Buffering** — Spans in bottom 15% of page grouped into footnote paragraphs
+8. **HTML Assembly** — Structured HTML with sections, headings, images, footnotes
+9. **TOC Linking** — Printed TOC entries linked to actual chapter headings
+10. **Cover Generation** — Best available cover from PDF content or generated design
+11. **EPUB Assembly** — Pandoc converts HTML to EPUB with metadata and cover
 
 ## Battle-Tested
 
-Tested across 25 diverse PDFs including philosophy texts, business books, memoirs, political works, and technical manuals. Results: 22 PASS, 3 WARN (missing author metadata only), 0 FAIL.
+Tested across 25 diverse PDFs including philosophy texts, business books, memoirs, political works, and technical manuals. Results: 20 PASS, 5 WARN, 0 FAIL.
 
 See [ERRORS_AND_FIXES.md](ERRORS_AND_FIXES.md) for the complete debugging history — every major issue, what caused it, what didn't work, and what ultimately fixed it.
 
@@ -65,5 +67,5 @@ See [ERRORS_AND_FIXES.md](ERRORS_AND_FIXES.md) for the complete debugging histor
 
 - **Scanned PDFs** — Detected and skipped (no OCR engine integrated)
 - **Spaced-out text** — PDFs that store characters with spaces between them (e.g., "p s y c h o l o g y") are reproduced as-is
-- **Complex layouts** — Multi-column text, tables, and heavily formatted pages may not convert perfectly
+- **Complex layouts** — Multi-column text and heavily formatted pages may not convert perfectly (simple tables are handled)
 - **Right-to-left languages** — Not tested or supported

@@ -2,7 +2,7 @@
 
 ## Status
 **Phase:** Core converter hardened and battle-tested across 25 PDFs.
-**Current:** 19 PASS, 6 WARN, 0 FAIL across all 25 test PDFs. WARNs are: missing author (2), minor PDF-source character spacing (3), low heading count (1). All books fully readable.
+**Current:** 20 PASS, 5 WARN, 0 FAIL across all 25 test PDFs. WARNs are: missing author (2), minor PDF-source character spacing (2), low heading count (1). All books fully readable.
 **Next:** Web portal (FastAPI-based upload/convert/download interface).
 
 ## Roadmap
@@ -27,7 +27,9 @@
 - [x] Span merging for per-character font-switching PDFs
 - [x] Spaced text collapsing (small-caps letter-spacing from PDF source)
 - [x] Garbled text detection in audit script
-- [x] Battle-tested on 25 diverse PDFs (19 PASS, 6 WARN, 0 FAIL)
+- [x] Table detection and formatting (multi-column data → HTML tables)
+- [x] Two-tier span merge (per-word spacing fix without breaking per-char merge)
+- [x] Battle-tested on 25 diverse PDFs (20 PASS, 5 WARN, 0 FAIL)
 - [ ] Web portal for upload/convert/download
 
 ## File Map

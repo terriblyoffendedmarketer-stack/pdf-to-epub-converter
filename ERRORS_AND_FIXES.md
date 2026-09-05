@@ -316,17 +316,62 @@ you've already fixed. An audit that only tests for known bugs gives false confid
 
 ---
 
+## 17. Table Detection and Formatting
+
+**Problem:** PDFs with tabular data (financial tables, comparison lists, homicide statistics,
+tables of contents with page numbers) had their columns flattened into plain `<p>` paragraphs.
+Freakonomics had drug revenue tables, homicide rate grids, and name comparison tables all
+rendered as single-line paragraphs. Writing Craft Essays (Palahniuk) had its entire TOC merged
+into one paragraph.
+
+**Root cause:** The converter treats all spans on the same line as a single paragraph, joining
+them with spaces. Tabular data (multiple spans at distinct x-positions on the same y-coordinate)
+gets collapsed into flat text.
+
+**What fixed it:** Added `_detect_tables_in_page()` — runs on each page's spans before HTML
+generation. Groups spans by y-coordinate, identifies rows with 2+ short spans at distinct x
+positions (spread > 80px, text < 80 chars), then requires 3+ consecutive such rows to declare
+a table region. Builds proper `<table>` HTML.
+
+**False positive prevention (critical):**
+- Requires cell text < 80 characters — body text paragraphs fail this check
+- Requires x-spread > 80px — distinguishes columns from within-paragraph font changes
+- Requires 3+ consecutive rows — a stray two-column line isn't a table
+- Network State initially triggered 155 false positives (per-word spans). Tightening thresholds
+  eliminated these while keeping genuine tables.
+
+**Result:** Freakonomics tables render in columns. Palahniuk TOC shows chapter/page pairs.
+
+---
+
+## 18. Per-Word Span Merging Missing Spaces
+
+**Problem:** Some PDFs (notably The Network State) encode each word as a separate span.
+The span merge code concatenated without adding spaces, producing "Ourhistoryistheprologue"
+instead of "Our history is the prologue".
+
+**Root cause:** The merge threshold (gap < 0.6 × font_size) was designed for per-character
+font switching (Worringer), where gap ≈ 0 and no space is wanted. Per-word spans have gaps
+of ~3-5px (word spacing), which also falls under the threshold but NEEDS a space.
+
+**What fixed it:** Two-tier merge logic based on gap size:
+- gap ≤ 15% of font_size → character-level merge (no space) — for per-char font switching
+- gap between 15% and 60% → word-level merge (add space) — for per-word spans
+- gap ≥ 60% → don't merge (separate column or structure)
+
+---
+
 ## Summary of Audit Results (25 PDFs)
 
 After all fixes, running `audit_epubs.py`:
 
 | Status | Count | Notes |
 |--------|-------|-------|
-| PASS   | 19    | Clean conversion, correct structure |
-| WARN   | 6     | Missing author (2), minor PDF-source spacing (3), low headings (1) |
+| PASS   | 20    | Clean conversion, correct structure |
+| WARN   | 5     | Missing author (2), minor PDF-source spacing (2), low headings (1) |
 | FAIL   | 0     | No structural failures |
 
 WARN details:
 - Freakonomics, Communist Manifesto: missing author metadata
-- Aristotle, Freud/Jung, Harry Lorayne: residual PDF-source character spacing (2-3 paragraphs each)
+- Aristotle, Freud/Jung: residual PDF-source character spacing (2 paragraphs each)
 - Steal Like An Artist: only 2 headings detected (visual book with minimal text structure)
