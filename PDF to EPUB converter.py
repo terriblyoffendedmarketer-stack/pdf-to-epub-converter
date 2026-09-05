@@ -339,6 +339,54 @@ def normalize_ligatures(text, fix_th=False):
     return text
 
 
+_SPACING_SAFE = frozenset({'I', 'a', 'A', 'O'})
+
+def collapse_spaced_text(text):
+    """Collapse letter-spaced text from PDF small-caps or character spacing.
+
+    Handles two patterns:
+    1. Pure single-letter runs: 'F R E U D' -> 'FREUD'
+    2. Small-caps fragments: 'N EW Y ORK' -> 'NEW YORK'
+       (single uppercase + lowercase tail, only in ALL-CAPS context)
+    """
+    # Phase 1: collapse pure single-letter runs (3+)
+    def _collapse_singles(m):
+        chars = m.group(0).split()
+        if all(c in _SPACING_SAFE for c in chars):
+            return m.group(0)
+        return ''.join(chars)
+    text = re.sub(r'(?<!\w)([a-zA-Z] ){2,}[a-zA-Z](?!\w)', _collapse_singles, text)
+
+    # Phase 2: small-caps fragment merging — only in ALL-CAPS spans
+    # 'N EW Y ORK T IMES' -> 'NEW YORK TIMES'
+    # Pattern: single uppercase letter + uppercase-starting fragment
+    # We only do this in regions that are predominantly uppercase
+    words = text.split()
+    if len(words) < 3:
+        return text
+
+    upper_ratio = sum(1 for w in words if w and w[0].isupper()) / len(words)
+    if upper_ratio < 0.5:
+        return text
+
+    # Merge: single uppercase letter followed by uppercase-start word
+    # 'N' + 'EW' -> 'NEW', 'T' + 'IMES' -> 'TIMES', 'M' + 'AGAZINE' -> 'MAGAZINE'
+    merged = []
+    i = 0
+    while i < len(words):
+        w = words[i]
+        if (len(w) == 1 and w.isupper() and w not in _SPACING_SAFE
+                and i + 1 < len(words)
+                and len(words[i + 1]) >= 2
+                and words[i + 1][0].isupper()):
+            merged.append(w + words[i + 1])
+            i += 2
+        else:
+            merged.append(w)
+            i += 1
+    return ' '.join(merged)
+
+
 def extract_spans(doc, pdf_path):
     """Extract text spans and images from every page, preserving block order."""
     pages_spans = []
@@ -400,20 +448,44 @@ def extract_spans(doc, pdf_path):
             else:
                 first_span_in_block = True
                 for line in block.get("lines", []):
+                    # Merge adjacent spans on the same line to avoid
+                    # char-level splitting (PDFs with per-char font changes)
+                    merged_line_spans = []
                     for span in line.get("spans", []):
                         text = span.get("text", "")
-                        if text.strip():
-                            spans.append({
-                                "is_image": False,
-                                "text": text,
-                                "size": round(span.get("size", 0), 1),
-                                "x0": span["bbox"][0],
-                                "y0": span["bbox"][1],
-                                "y1": span["bbox"][3],
-                                "page_height": h,
-                                "new_block": first_span_in_block,
-                            })
-                            first_span_in_block = False
+                        if not text.strip():
+                            continue
+                        bbox = span["bbox"]
+                        sz = round(span.get("size", 0), 1)
+                        if merged_line_spans:
+                            prev = merged_line_spans[-1]
+                            gap = bbox[0] - prev["x1"]
+                            avg_sz = (prev["size"] + sz) / 2
+                            if gap < avg_sz * 0.6:
+                                prev["text"] += text
+                                prev["x1"] = bbox[2]
+                                prev["y1"] = max(prev["y1"], bbox[3])
+                                continue
+                        merged_line_spans.append({
+                            "text": text,
+                            "size": sz,
+                            "x0": bbox[0],
+                            "x1": bbox[2],
+                            "y0": bbox[1],
+                            "y1": bbox[3],
+                        })
+                    for ms in merged_line_spans:
+                        spans.append({
+                            "is_image": False,
+                            "text": ms["text"],
+                            "size": ms["size"],
+                            "x0": ms["x0"],
+                            "y0": ms["y0"],
+                            "y1": ms["y1"],
+                            "page_height": h,
+                            "new_block": first_span_in_block,
+                        })
+                        first_span_in_block = False
 
         pages_spans.append(spans)
 
@@ -1049,6 +1121,7 @@ def process_file(pdf_path, output_dir=None):
                 for s in page_spans:
                     if not s.get("is_image") and "text" in s:
                         s["text"] = normalize_ligatures(s["text"], fix_th=fix_th)
+                        s["text"] = collapse_spaced_text(s["text"])
 
             header_set, footer_set = detect_headers_footers(pages_spans)
             body_size, heading_map = classify_heading_sizes(pages_spans)

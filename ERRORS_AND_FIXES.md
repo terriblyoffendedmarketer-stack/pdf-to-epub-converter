@@ -243,15 +243,90 @@ after edits to catch this immediately.
 
 ---
 
+## 14. Per-Character Font Switching (Span Splitting)
+
+**Problem:** Some PDFs (notably Worringer "Abstraction and Empathy") encode text where each
+character uses a slightly different font variant. PyMuPDF's `get_text("dict")` returns each
+character as a separate span because the font ID changes per glyph. Our converter then joined
+these spans with spaces, turning "progression" into "p r o g r e ssi o n".
+
+**Key discovery:** `get_text("text")` returns clean text for these PDFs because it ignores
+font boundaries. But `get_text("dict")` — which we need for layout analysis (font sizes,
+positions, heading detection) — splits on every font change.
+
+**Misdiagnosis:** Initially reported as "PDF source issue — unsolvable without OCR." This was
+wrong. The text data was correct; our extraction method was splitting it. The visual audit
+(CLIP scoring) didn't catch it because CLIP can't detect garbled text within otherwise
+well-formatted pages. Only a text-level check would have found it.
+
+**What fixed it:** In `extract_spans()`, merge adjacent spans on the same line when their
+horizontal gap is less than 60% of the average font size. This joins character-level spans
+back into word-level spans while preserving intentional word spacing.
+
+```python
+if gap < avg_sz * 0.6:
+    prev["text"] += text  # merge into previous span
+```
+
+**Result:** Worringer went from 42 garbled paragraphs to 1 (an intentionally spaced heading).
+
+---
+
+## 15. Small-Caps Letter-Spacing in PDF Source
+
+**Problem:** Some PDFs use CSS-style letter-spacing for small-caps text. The text stream
+literally contains "N EW Y ORK T IMES" instead of "NEW YORK TIMES". Both `get_text("text")`
+and `get_text("dict")` return the spaced version — it's genuinely encoded that way.
+
+**Affected books:** Freakonomics (chapter epigraphs), Freud/Jung Letters (signature lines),
+Aristotle (footnote references), Harry Lorayne (alphabet tables).
+
+**What fixed it — `collapse_spaced_text()`:**
+1. **Phase 1:** Collapse runs of 3+ single letters separated by spaces. "F R E U D" -> "FREUD".
+   Excludes common single-letter words (I, a, A, O) to avoid false positives.
+2. **Phase 2:** In all-caps regions (>50% words start uppercase), merge single uppercase
+   letter + uppercase-starting fragment pairs. "N EW" -> "NEW", "T IMES" -> "TIMES".
+
+**What can't be fixed:** Mixed-case character spacing like "o f" for "of" or "th e" for "the"
+where the fragments look like valid English words. Would require a dictionary/spell-checker.
+These are flagged as WARN in the audit.
+
+---
+
+## 16. Audit Gap — Garbled Text Not Detected
+
+**Problem:** The original audit script (`audit_epubs.py`) only checked for mid-sentence
+paragraph breaks, metadata, headings, and ligatures. It had no check for garbled/spaced-out
+text within words. This meant 42 garbled paragraphs in Worringer went completely undetected,
+and the audit reported "22 PASS" when it should have been "FAIL" for several books.
+
+**Root cause:** The audit was designed around the problems we knew about (line breaks, metadata)
+and never considered character-level text corruption.
+
+**What fixed it:** Added a garbled text detector to the audit:
+```python
+singles = sum(1 for w in words if len(w) == 1 and w.isalpha())
+if singles > len(words) * 0.3:
+    garbled_paras += 1
+```
+Thresholds: >5 garbled paragraphs = FAIL, >1 = WARN.
+
+**Lesson:** Always verify audit coverage against the actual failure modes, not just the ones
+you've already fixed. An audit that only tests for known bugs gives false confidence.
+
+---
+
 ## Summary of Audit Results (25 PDFs)
 
 After all fixes, running `audit_epubs.py`:
 
 | Status | Count | Notes |
 |--------|-------|-------|
-| PASS   | 22    | Clean conversion, correct structure |
-| WARN   | 3     | Missing author metadata only — not a content issue |
+| PASS   | 19    | Clean conversion, correct structure |
+| WARN   | 6     | Missing author (2), minor PDF-source spacing (3), low headings (1) |
 | FAIL   | 0     | No structural failures |
 
-The 3 WARN books have no author in PDF metadata and no "by Author" pattern on their title pages.
-The non-blocking author prompt at end of batch conversion addresses this.
+WARN details:
+- Freakonomics, Communist Manifesto: missing author metadata
+- Aristotle, Freud/Jung, Harry Lorayne: residual PDF-source character spacing (2-3 paragraphs each)
+- Steal Like An Artist: only 2 headings detected (visual book with minimal text structure)

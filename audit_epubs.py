@@ -83,6 +83,23 @@ def audit_epub(epub_path):
                 heading_count += len(re.findall(r'<h[1-6]', html))
                 image_count += len(re.findall(r'<img\b', html))
 
+            # 4. GARBLED TEXT DETECTION (single-char word spam from broken span merging)
+            garbled_paras = 0
+            for f in content_files:
+                html = z.read(f).decode('utf-8', errors='replace')
+                for attrs, p in re.findall(r'<p([^>]*)>(.*?)</p>', html, re.DOTALL):
+                    text = re.sub(r'<[^>]+>', '', p).strip()
+                    words = text.split()
+                    if len(words) > 10:
+                        singles = sum(1 for w in words if len(w) == 1 and w.isalpha())
+                        if singles > len(words) * 0.3:
+                            garbled_paras += 1
+
+            if garbled_paras > 5:
+                results["issues"].append(f"GARBLED: {garbled_paras} paragraphs with broken character spacing")
+            elif garbled_paras > 1:
+                results["warnings"].append(f"GARBLED: {garbled_paras} paragraphs with possible character spacing issues")
+
             results["stats"]["paragraphs"] = total_paras
             results["stats"]["headings"] = heading_count
             results["stats"]["images"] = image_count
