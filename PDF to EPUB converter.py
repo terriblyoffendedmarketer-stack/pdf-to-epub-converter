@@ -331,6 +331,12 @@ def _fix_th_ligature(text):
     return text
 
 
+_ILLEGAL_XML_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+def strip_control_chars(text):
+    """Remove control characters illegal in XML (keeps tab, newline, carriage return)."""
+    return _ILLEGAL_XML_CHARS.sub('', text)
+
 def normalize_ligatures(text, fix_th=False):
     """Decompose Unicode ligatures (ﬀ→ff, ﬁ→fi, etc.) and optionally fix Th ligature."""
     text = unicodedata.normalize("NFKC", text)
@@ -1275,6 +1281,7 @@ def process_file(pdf_path, output_dir=None):
                     if not s.get("is_image") and "text" in s:
                         s["text"] = normalize_ligatures(s["text"], fix_th=fix_th)
                         s["text"] = collapse_spaced_text(s["text"])
+                        s["text"] = strip_control_chars(s["text"])
 
             # Detect and format tabular regions before building HTML
             table_count = 0
