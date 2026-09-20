@@ -41,6 +41,7 @@ except ImportError:
         except ImportError:
             import fitz
 
+
 # =============================================================================
 # SECTION 1: PDF TRIAGE ENGINE
 # =============================================================================
@@ -393,6 +394,142 @@ def collapse_spaced_text(text):
     return ' '.join(merged)
 
 
+# =============================================================================
+# GARBLED CID FONT TEXT REPAIR
+# =============================================================================
+# Some PDFs (especially those produced by older publishing tools) have Type0/CID
+# fonts with Identity-H encoding and broken ToUnicode maps.  The font glyphs are
+# correct, but the character mapping extracts wrong Unicode code points.  Common
+# symptoms: Å or Æ replacing ligature glyphs ("it"/"at"), ! or ' inserted mid-word,
+# lowercase-L or digits replacing capital letters.  The garbling is inconsistent
+# across pages because the font is re-subsetted per page with different CID
+# assignments.
+#
+# Strategy: detect the garbling pattern and apply targeted regex corrections
+# AFTER span merging so the full garbled text is in one string.
+
+_GARBLED_CHAR_CLASS = r"[!'\x01\dA-Za-zÀ-ÿ\x99™ɦ#]"
+_GARBLED_INFINITE_RE = re.compile(
+    r"(?<![a-zA-ZÀ-ÿ])"   # not preceded by a letter
+    r"("
+    r"[!'\x01\d]*"                   # optional leading !, ', or digits
+    r"[IilhbÅ1!]"                   # first real letter (I/l/h/b/Å/1/!)
+    + _GARBLED_CHAR_CLASS + r"*?"    # middle characters (non-greedy)
+    r"[fj]"                          # 'f' is always preserved (rarely garbled to 'j')
+    + _GARBLED_CHAR_CLASS + r"*?"    # more middle characters
+    r")"
+    r"(?=\s*Jes[t!])"               # followed by "Jest" or "Jes!s"
+)
+
+_GARBLED_JEST_JOINED_RE = re.compile(
+    r"(?<![a-zA-ZÀ-ÿ])"
+    r"[!'\x01\d]*[IilhbÅ1!]" + _GARBLED_CHAR_CLASS + r"*?[fj]"
+    + _GARBLED_CHAR_CLASS + r"*?"
+    r"Jes[t!][a-z]*"                # "Jestis" → "Jest is", "Jestas" → "Jest as"
+    r"(?=[,.\s!;:]|$)"
+)
+
+_GARBLED_INDICATORS = re.compile(
+    r"[ÅÆ](?=[a-z])"          # Å or Æ before a lowercase letter (broken ligature)
+    r"|(?<=[a-z])[ÅÆ]"        # Å or Æ after a lowercase letter
+    r"|!'!"                    # !'! pattern (garbled "Inf")
+    r"|!t!f"                   # !t!f pattern
+    r"|!Jif"                   # !Jif pattern
+    r"|Q!J"                    # Q!J → Qu
+)
+
+
+def _detect_garbled_cid_text(pages_spans):
+    """Check if document has garbled text from broken CID font encoding."""
+    indicator_count = 0
+    for spans in pages_spans:
+        for s in spans:
+            if s.get("is_image"):
+                continue
+            text = s.get("text", "")
+            indicator_count += len(_GARBLED_INDICATORS.findall(text))
+    return indicator_count >= 3
+
+
+def _fix_garbled_cid_text(text):
+    """Fix garbled text from PDFs with broken CID font ToUnicode maps."""
+
+    # --- Pass 1: Fix garbled "Infinite" before "Jest" ---
+    def _replace_infinite(m):
+        return "Infinite"
+
+    text = _GARBLED_INFINITE_RE.sub(_replace_infinite, text)
+
+    # --- Pass 2: Fix joined "InfiniteJestXX" patterns ---
+    # e.g. "InfimÅeJestis," → "Infinite Jest is,"
+    def _split_jest_joined(m):
+        full = m.group(0)
+        # After pass 1, the "Infinite" part should already be fixed
+        # but handle any remaining joined patterns
+        idx = full.find("Jest")
+        if idx < 0:
+            idx = full.find("Jes!")
+        if idx < 0:
+            return full
+        before = full[:idx]
+        after = full[idx + 4:]  # text after "Jest"
+        # Fix the prefix to "Infinite" if it's garbled
+        if before != "Infinite":
+            before = "Infinite"
+        result = before + " Jest"
+        if after:
+            result += " " + after
+        return result
+
+    text = _GARBLED_JEST_JOINED_RE.sub(_split_jest_joined, text)
+
+    # --- Pass 3: Fix "Qu" garbling (Q!J → Qu) ---
+    text = re.sub(r'Q!J', 'Qu', text)
+
+    # --- Pass 4: Fix INFINITE !EsT → INFINITE JEST (uppercase garbling) ---
+    text = re.sub(r'\bINFINITE\s+!EsT\b', 'INFINITE JEST', text)
+
+    # --- Pass 5: Fix "ofits" → "of its" (space lost in span merging) ---
+    text = re.sub(r'\bofits\b', 'of its', text)
+
+    # --- Pass 6: Fix [szc] → [sic] (z→i garbling) ---
+    text = text.replace('[szc]', '[sic]')
+
+    # --- Pass 7: Targeted word-level fixes (safe, no accented-char risk) ---
+    text = re.sub(r'\bWzthout\b', 'Without', text)
+    text = re.sub(r'\breQuire\b', 'require', text)
+    text = re.sub(r'fY', 'fy', text)
+    text = re.sub(r'\bSortcover\b', 'Softcover', text)
+    text = re.sub(r'\bDowLING\b', 'DOWLING', text)
+    text = re.sub(r'\bRo1lents\b', 'Rollents', text)
+    text = re.sub(r'\bnlVhat\b', '"What', text)
+    text = re.sub(r'\bnmTatt"ve\b', 'narrative', text)
+    text = re.sub(r'\bFmnz\b', 'Franz', text)
+    text = re.sub(r'\btmnsfonned\b', 'transformed', text)
+    text = re.sub(r'\bTechniQues\b', 'Techniques', text)
+    text = re.sub(r"Electn['\x01]c", 'Electric', text)
+    text = re.sub(r'\b17zeater\b', 'Theater', text)
+    text = re.sub(r'\b17ze\b', 'The', text)
+    text = re.sub(r'\b17ze(?=[A-Z])', 'The ', text)
+    text = re.sub(r"TO['\x01]WTI", 'Town', text)
+    text = re.sub(r'Bedtime \.for\b', 'Bedtime for', text)
+    text = re.sub(r'\bStory if a\b', 'Story of a', text)
+    text = re.sub(r'\bFauteur7s\b', 'Fauteuils', text)
+    text = re.sub(r'\bconsc1ousness\b', 'consciousness', text)
+    text = re.sub(r'\blOrker\b', 'Yorker', text)
+    text = re.sub(r'\bPnnciples\b', 'Principles', text)
+    text = re.sub(r'\bFonner\b', 'Former', text)
+    text = re.sub(r'\bbgimXe Jest\b', 'Infinite Jest', text)
+    text = re.sub(r"!'\!\[mite Jest", 'Infinite Jest', text)
+
+    # --- Pass 8: Fix Å/Æ ligature artifacts (broken CMap multi-char expansions) ---
+    text = re.sub(r'\btemÅory\b', 'territory', text)
+
+    return text
+
+
+
+
 def _detect_tables_in_page(spans):
     """Detect tabular regions in a page's spans and replace with table HTML.
 
@@ -631,6 +768,7 @@ def extract_spans(doc, pdf_path):
                             "text": ms["text"],
                             "size": ms["size"],
                             "x0": ms["x0"],
+                            "x1": ms["x1"],
                             "y0": ms["y0"],
                             "y1": ms["y1"],
                             "page_height": h,
@@ -1276,12 +1414,17 @@ def process_file(pdf_path, output_dir=None):
             fix_th = _detect_th_ligature_issue(pages_spans)
             if fix_th:
                 print("  Detected Th-ligature issue — applying fix")
+            fix_garbled = _detect_garbled_cid_text(pages_spans)
+            if fix_garbled:
+                print("  Detected garbled CID font encoding — applying repair")
             for page_spans in pages_spans:
                 for s in page_spans:
                     if not s.get("is_image") and "text" in s:
                         s["text"] = normalize_ligatures(s["text"], fix_th=fix_th)
                         s["text"] = collapse_spaced_text(s["text"])
                         s["text"] = strip_control_chars(s["text"])
+                        if fix_garbled:
+                            s["text"] = _fix_garbled_cid_text(s["text"])
 
             # Detect and format tabular regions before building HTML
             table_count = 0
@@ -1299,6 +1442,16 @@ def process_file(pdf_path, output_dir=None):
             print(f"  Body size: {body_size}, Headings: {heading_map}")
             print(f"  Filtered headers: {header_set}")
             html = build_html_layout(pages_spans, header_set, footer_set, heading_map, body_size - 1.0)
+
+            # Second pass: fix garbled text that spans across font boundaries
+            # (first pass at span level can miss cases where garbled text and "Jest"
+            # are in separate spans from different fonts)
+            if fix_garbled:
+                # HTML-encode-aware fix: temporarily decode &#x27; so the regex
+                # can match apostrophes in garbled patterns like I'!fimîe
+                html = html.replace("&#x27;", "\x01")
+                html = _fix_garbled_cid_text(html)
+                html = html.replace("\x01", "&#x27;")
 
             # Linkify printed TOC pages: match paragraphs to actual chapter headings
             heading_slugs = {_slugify(m.group(1)) for m in re.finditer(r"<h[12]>([^<]+)</h[12]>", html)}

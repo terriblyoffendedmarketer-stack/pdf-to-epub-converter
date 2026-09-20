@@ -30,6 +30,7 @@
 - [x] Table detection and formatting (multi-column data → HTML tables)
 - [x] Two-tier span merge (per-word spacing fix without breaking per-char merge)
 - [x] Battle-tested on 25 diverse PDFs (20 PASS, 5 WARN, 0 FAIL)
+- [x] Garbled CID font repair (broken Type0/Identity-H ToUnicode maps)
 - [x] Web portal for upload/convert/download
 
 ## File Map
@@ -59,3 +60,4 @@
 - Footnotes are buffered per-block to avoid word-per-paragraph splitting
 - Audit excludes footnote paragraphs from mid-sentence break counting
 - After batch conversion, user is prompted to fill in missing author names (non-blocking)
+- Garbled CID font detection: auto-detects broken Type0/Identity-H fonts via indicator patterns (Å/Æ mid-word, !'!, Q!J); applies regex-based repair for "Infinite Jest" variants + targeted word fixes; runs at both span-level and HTML-level to handle cross-font-boundary garbling; `\x99` (Windows-1252 ™) must be in char class alongside `™` (U+2122)
