@@ -898,17 +898,40 @@ def extract_spans(doc, pdf_path):
                 area_ratio = (img_w * img_h) / page_area if page_area > 0 else 0
 
                 if area_ratio > 0.6:
-                    # Full-bleed image: cover candidate on page 0, background overlay otherwise
-                    # Reject tiny pixel images (e.g. 1x1 transparent placeholders)
                     real_w = block.get("width", 0)
                     real_h = block.get("height", 0)
+                    if real_w <= 2 or real_h <= 2:
+                        continue
                     if page_num == 0 and cover_image_path is None and real_w > 50 and real_h > 50:
                         ext = block.get("ext", "png")
                         img_path = os.path.join(img_dir, f"cover.{ext}")
                         with open(img_path, "wb") as f:
                             f.write(block["image"])
                         cover_image_path = img_path
-                    # Skip background overlays on other pages
+                        continue
+                    # Large image on non-cover page: check if it's a background
+                    # overlay (full-bleed on a page with text) or real content
+                    page_text_blocks = [b for b in d.get("blocks", [])
+                                        if b.get("type", 0) == 0
+                                        and any(s.get("text", "").strip()
+                                                for l in b.get("lines", [])
+                                                for s in l.get("spans", []))]
+                    if area_ratio > 0.95 and page_text_blocks:
+                        continue
+                    # Not a background — treat as content image
+                    ext = block.get("ext", "png")
+                    img_path = os.path.join(img_dir, f"img_{page_num}_{img_counter}.{ext}")
+                    with open(img_path, "wb") as f:
+                        f.write(block["image"])
+                    img_counter += 1
+                    spans.append({
+                        "is_image": True,
+                        "src": os.path.join(img_dir_name, os.path.basename(img_path)),
+                        "y0": bbox[1],
+                        "y1": bbox[3],
+                        "page_height": h,
+                        "new_block": True,
+                    })
                 elif area_ratio > 0.005:
                     # Real inline image — save it
                     ext = block.get("ext", "png")
