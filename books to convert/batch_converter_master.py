@@ -758,6 +758,12 @@ def _detect_tables_in_page(spans):
         longest = max(len(s["text"].strip()) for _, s in row)
         if longest > 80:
             continue
+        # Reject rows where spans look like inline text (mixed font sizes on
+        # the same line) rather than real table cells — if joining the spans
+        # produces a long sentence, it's body text with font switching
+        joined = " ".join(s["text"].strip() for _, s in sorted(row, key=lambda e: e[1]["x0"]))
+        if len(joined) > 60:
+            continue
         multi_col_ys.append(y_key)
 
     if len(multi_col_ys) < 3:
