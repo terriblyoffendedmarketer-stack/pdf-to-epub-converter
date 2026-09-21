@@ -38,6 +38,7 @@
 - [x] Enumerated list item preservation (`(N)` patterns as separate paragraphs)
 - [x] False table detection fix (mixed-font inline text no longer misidentified as tables)
 - [x] Conversion-time quality warnings (length-aware thresholds, no false positives on short stories)
+- [x] Large illustration image preservation (>60% area images kept as content; only >95% full-bleed with text = background overlay)
 
 ## File Map
 - `PDF to EPUB converter.py` — Main converter script. Run with: `python3 "PDF to EPUB converter.py" <dir-or-file> [-y] [-o output_dir]`
@@ -69,3 +70,4 @@
 - Audit excludes footnote paragraphs from mid-sentence break counting
 - After batch conversion, user is prompted to fill in missing author names (non-blocking)
 - Garbled CID font detection: auto-detects broken Type0/Identity-H fonts via indicator patterns (Å/Æ mid-word, !'!, Q!J); applies regex-based repair for "Infinite Jest" variants + targeted word fixes; runs at both span-level and HTML-level to handle cross-font-boundary garbling; `\x99` (Windows-1252 ™) must be in char class alongside `™` (U+2122)
+- Image area_ratio thresholds: >0.95 on text pages = background overlay (skip), 0.6-0.95 = large content image (keep), 0.005-0.6 = standard inline image, <0.005 = noise (skip). Tiny pixel images (<=2px) always skipped.
