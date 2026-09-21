@@ -1170,6 +1170,7 @@ def _fix_paragraph_breaks(pages_spans, heading_sizes, header_set=None, footer_se
         gap_threshold = typical_gap * 1.8 if typical_gap > 0 else 999
         prev_y1 = None
         after_heading_or_image = True
+        prev_has_dots = False
         for s in spans:
             if s.get("is_image"):
                 after_heading_or_image = True
@@ -1184,10 +1185,11 @@ def _fix_paragraph_breaks(pages_spans, heading_sizes, header_set=None, footer_se
                 gap = s["y0"] - prev_y1
                 is_indented = x0 > dominant_x0 + indent_threshold
                 has_large_gap = gap > gap_threshold
-                if not is_indented and not has_large_gap:
+                if not is_indented and not has_large_gap and not prev_has_dots:
                     s["new_block"] = False
             after_heading_or_image = False
             prev_y1 = s["y1"]
+            prev_has_dots = '....' in s.get("text", "")
 
     # Cross-page merging
     def _is_marginal(s, ph):
@@ -1446,7 +1448,7 @@ def build_html_layout(pages_spans, header_set, footer_set, heading_map, footnote
             m_cur = _P_RE.match(lines[i])
             if m_cur:
                 cur_tag, cur_content = m_cur.group(1), m_cur.group(2).rstrip()
-                if cur_content and cur_content[-1] not in _SENT_ENDERS:
+                if cur_content and cur_content[-1] not in _SENT_ENDERS and '....' not in cur_content:
                     j = i + 1
                     between = []
                     while j < len(lines) and not _P_RE.match(lines[j]):
@@ -1642,6 +1644,70 @@ def extract_title_author(doc, pdf_path):
 # SECTION 4: MASTER ORCHESTRATOR & BATCH LOGGING
 # =============================================================================
 
+def _check_conversion_quality(epub_path, page_count):
+    """Run quick quality checks on a converted EPUB. Returns list of warning strings."""
+    warnings = []
+    try:
+        import zipfile
+        with zipfile.ZipFile(epub_path) as z:
+            names = z.namelist()
+
+            # Metadata checks
+            opf_files = [n for n in names if n.endswith('.opf')]
+            title = author = None
+            heading_count = 0
+            total_paras = 0
+            mid_sentence_breaks = 0
+            if opf_files:
+                opf = z.read(opf_files[0]).decode('utf-8', errors='replace')
+                tm = re.search(r'<dc:title[^>]*>([^<]+)</dc:title>', opf)
+                if tm: title = tm.group(1).strip()
+                am = re.search(r'<dc:creator[^>]*>([^<]+)</dc:creator>', opf)
+                if am: author = am.group(1).strip()
+
+            if not author:
+                warnings.append("No author metadata")
+
+            content_files = sorted([n for n in names if n.endswith('.xhtml') and 'ch' in os.path.basename(n)])
+            if not content_files:
+                content_files = sorted([n for n in names if n.endswith('.xhtml')])
+
+            _SENT = set('.!?:;\'")' + chr(0x201D) + chr(0x2019))
+            for f in content_files:
+                html = z.read(f).decode('utf-8', errors='replace')
+                heading_count += len(re.findall(r'<h[1-6]', html))
+                paras = re.findall(r'<p([^>]*)>(.*?)</p>', html, re.DOTALL)
+                for i, (attrs, p) in enumerate(paras):
+                    text = re.sub(r'<[^>]+>', '', p).strip()
+                    if not text:
+                        continue
+                    total_paras += 1
+                    if 'footnote' in attrs:
+                        continue
+                    if i < len(paras) - 1:
+                        nxt_attrs, nxt_p = paras[i + 1]
+                        nxt = re.sub(r'<[^>]+>', '', nxt_p).strip()
+                        if nxt and 'footnote' not in nxt_attrs:
+                            if text[-1] not in _SENT and nxt.split()[0][0:1].islower():
+                                mid_sentence_breaks += 1
+
+            # Low heading count — only for longer books (50+ pages)
+            if page_count >= 50 and heading_count < 3:
+                warnings.append(f"Only {heading_count} heading(s) detected — source PDF may use uniform font sizes")
+
+            # Mid-sentence breaks — only flag if statistically significant
+            if total_paras >= 50:
+                pct = mid_sentence_breaks / total_paras * 100
+                if pct > 5:
+                    warnings.append(f"{mid_sentence_breaks} mid-sentence breaks ({pct:.1f}% of paragraphs)")
+                elif mid_sentence_breaks > 10 and pct > 2:
+                    warnings.append(f"{mid_sentence_breaks} mid-sentence breaks ({pct:.1f}%)")
+
+    except Exception:
+        pass
+    return warnings
+
+
 def process_file(pdf_path, output_dir=None):
     """Convert a single PDF to EPUB. Returns (filename, category, status, message)."""
     filename = os.path.basename(pdf_path)
@@ -1664,6 +1730,7 @@ def process_file(pdf_path, output_dir=None):
             return filename, category, "SKIPPED", note
 
         doc = fitz.open(pdf_path)
+        page_count = len(doc)
         title, author = extract_title_author(doc, pdf_path)
         print(f"  Title: {title}")
         if author:
@@ -1755,7 +1822,13 @@ def process_file(pdf_path, output_dir=None):
             return filename, category, "FAILED", msg
 
         print(f"  -> {epub_path}")
-        return filename, category, "SUCCESS", "", title, author, epub_path
+
+        # Post-conversion quality warnings
+        warnings = _check_conversion_quality(epub_path, page_count)
+        for w in warnings:
+            print(f"  WARN: {w}")
+
+        return filename, category, "SUCCESS", "", title, author, epub_path, warnings
 
     except Exception as e:
         msg = str(e)
@@ -1798,16 +1871,22 @@ if __name__ == "__main__":
     print("=" * 80)
     print(f"{'STATUS':<10} | {'CATEGORY':<12} | {'FILE'}")
     print("-" * 80)
-    for filename, category, status, *_ in results:
+    for r in results:
+        filename, category, status = r[0], r[1], r[2]
         icon = {"SUCCESS": "+", "FAILED": "X", "SKIPPED": "-"}.get(status, "?")
-        print(f"[{icon}] {status:<8} | {category:<12} | {filename}")
+        # Extract warnings if present (last element of SUCCESS tuple)
+        conv_warnings = r[-1] if len(r) >= 8 and isinstance(r[-1], list) else []
+        warn_suffix = ""
+        if conv_warnings:
+            warn_suffix = f"  [{', '.join(conv_warnings)}]"
+        print(f"[{icon}] {status:<8} | {category:<12} | {filename}{warn_suffix}")
     print("=" * 80 + "\n")
 
     # Non-blocking author metadata prompt
     missing_author = []
     for r in results:
         if len(r) >= 7:
-            filename, category, status, msg, title, author, epub_path = r
+            filename, category, status, msg, title, author, epub_path = r[0], r[1], r[2], r[3], r[4], r[5], r[6]
             if status == "SUCCESS" and not author:
                 missing_author.append((title, epub_path))
 
