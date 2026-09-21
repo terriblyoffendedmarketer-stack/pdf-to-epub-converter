@@ -16,6 +16,10 @@ books to convert/*_images/
 uploads/
 converted/
 
+# Test files
+test_pdfs/
+test_output/
+
 # Virtualenv
 pdf_env/
 books to convert/pdf_env/

@@ -100,6 +100,54 @@ def audit_epub(epub_path):
             elif garbled_paras > 1:
                 results["warnings"].append(f"GARBLED: {garbled_paras} paragraphs with possible character spacing issues")
 
+            # 5. FORMATTING TAGS (italic/bold)
+            em_count = 0
+            strong_count = 0
+            for f in content_files:
+                html = z.read(f).decode('utf-8', errors='replace')
+                em_count += len(re.findall(r'<em\b', html))
+                strong_count += len(re.findall(r'<strong\b', html))
+            results["stats"]["italic_spans"] = em_count
+            results["stats"]["bold_spans"] = strong_count
+
+            # 6. CID ENCODING ARTIFACTS (Å/Æ mid-word, !'!, ]OI, etc.)
+            cid_artifacts = 0
+            for f in content_files:
+                html = z.read(f).decode('utf-8', errors='replace')
+                text = re.sub(r'<[^>]+>', '', html)
+                cid_artifacts += len(re.findall(r'[A-Za-z][ÅÆ][a-z]', text))
+                cid_artifacts += len(re.findall(r"!'\!", text))
+                cid_artifacts += len(re.findall(r'\]OI\b', text))
+            if cid_artifacts > 0:
+                results["issues"].append(f"CID_ARTIFACTS: {cid_artifacts} possible garbled CID font patterns")
+
+            # 7. EMPTY CHAPTERS (chapter files with no paragraph text)
+            empty_chapters = 0
+            for f in content_files:
+                html = z.read(f).decode('utf-8', errors='replace')
+                text = re.sub(r'<[^>]+>', '', html).strip()
+                if len(text) < 10:
+                    empty_chapters += 1
+            if empty_chapters > 0:
+                results["warnings"].append(f"EMPTY_CH: {empty_chapters} chapter file(s) with minimal content")
+
+            # 8. WORD-SPACING ARTIFACTS (fused words like "ofthe", "inthe")
+            fused_words = 0
+            fused_examples = []
+            fuse_pattern = re.compile(r'\b(of|in|to|for|the|and|with|from|that|this|but|not|are|was|has|had|his|her|its|our)(?:the|his|her|its|our|the|a|an|this|that|one|all)\b', re.IGNORECASE)
+            for f in content_files:
+                html = z.read(f).decode('utf-8', errors='replace')
+                text = re.sub(r'<[^>]+>', '', html)
+                matches = fuse_pattern.findall(text)
+                fused_words += len(matches)
+                if matches and len(fused_examples) < 3:
+                    for m in re.finditer(fuse_pattern.pattern, text, re.IGNORECASE):
+                        if len(fused_examples) < 3:
+                            fused_examples.append(m.group(0))
+            if fused_words > 10:
+                eg = ", ".join(fused_examples[:3])
+                results["warnings"].append(f"FUSED_WORDS: {fused_words} likely fused words (e.g. {eg})")
+
             results["stats"]["paragraphs"] = total_paras
             results["stats"]["headings"] = heading_count
             results["stats"]["images"] = image_count
@@ -157,6 +205,11 @@ def main():
         print(f"{icon} {status:4s} | {short}")
         print(f"       Title: {s.get('title','?')[:60]} | Author: {s.get('author','?')[:35]}")
         print(f"       Paras: {s.get('paragraphs',0)} | H: {s.get('headings',0)} | Img: {s.get('images',0)} | TOC: {s.get('toc_entries',0)} | AvgP: {s.get('avg_para','?')} | MedP: {s.get('median_para','?')}")
+        fmt_parts = []
+        if s.get('italic_spans', 0): fmt_parts.append(f"<em>: {s['italic_spans']}")
+        if s.get('bold_spans', 0): fmt_parts.append(f"<strong>: {s['bold_spans']}")
+        if fmt_parts:
+            print(f"       Formatting: {' | '.join(fmt_parts)}")
         for i in r["issues"]: print(f"       ** {i}")
         for w in r["warnings"]: print(f"       *  {w}")
         print()

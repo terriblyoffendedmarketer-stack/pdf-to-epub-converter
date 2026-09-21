@@ -1484,14 +1484,61 @@ def _looks_like_person_name(text):
     # Parenthetical content suggests a title, not a name
     if "(" in text:
         return False
-    # Single well-known author names
-    if len(words) == 1 and words[0][0].isupper():
-        return True
+    # Single word: only a name if mixed case (not ALL-CAPS or all-lower)
+    if len(words) == 1:
+        w = words[0]
+        return len(w) >= 2 and w[0].isupper() and not w.isupper()
     # 2-4 capitalized words with no function words = likely a name
+    # Allow lowercase middle words for names with particles (van, de, chul, bin, etc.)
     if len(words) >= 2:
         capitalized = sum(1 for w in words if w[0].isupper())
-        return capitalized >= len(words) * 0.7
+        if capitalized >= len(words) * 0.7:
+            return True
+        if len(words) == 3 and words[0][0].isupper() and words[2][0].isupper():
+            return True
     return False
+
+
+def _is_garbage_metadata(text):
+    """Check if a metadata string looks like tool/conversion artifacts."""
+    if not text:
+        return True
+    low = text.lower()
+    garbage_patterns = [
+        "converted with", "microsoft word", "www.", ".doc", ".docx",
+        "acropad", "acrobat", "pdfcreator", "calibre", "libgen",
+        "http:", "https:", "freeware", "scanner", "ocr",
+    ]
+    return any(p in low for p in garbage_patterns)
+
+
+def _parse_filename_title_author(pdf_path):
+    """Parse 'Author - Title' or 'Title - Author' from filename."""
+    basename = os.path.splitext(os.path.basename(pdf_path))[0]
+    clean_basename = re.sub(r"\{[^}]*\}", "", basename).strip()
+    clean_basename = re.sub(r'-pdfread$', '', clean_basename).strip()
+
+    if " - " in clean_basename:
+        parts = clean_basename.split(" - ")
+        if len(parts) == 2:
+            left, right = parts[0].strip(), parts[1].strip()
+        else:
+            left = parts[0].strip()
+            right = " - ".join(parts[1:]).strip()
+
+        left_clean = re.sub(r'\s*\([^)]*\)\s*$', '', left).strip()
+        right_clean = re.sub(r'\s*\([^)]*\)\s*$', '', right).strip()
+
+        left_is_name = _looks_like_person_name(left_clean)
+        right_is_name = _looks_like_person_name(right_clean)
+        if left_is_name and not right_is_name:
+            return right_clean, left_clean
+        elif right_is_name and not left_is_name:
+            return left_clean, right_clean
+        else:
+            return right_clean, left_clean
+
+    return clean_basename, ""
 
 
 def _extract_title_from_titlepage(doc):
@@ -1548,7 +1595,10 @@ def _extract_title_from_titlepage(doc):
 
 
 def extract_title_author(doc, pdf_path):
-    """Extract title and author from metadata, title-page text, or filename."""
+    """Extract title and author from metadata, title-page text, or filename.
+    Priority: (1) title-page "by" pattern, (2) filename with clear author-title
+    split, (3) PDF metadata, (4) filename without author detection.
+    """
     meta = doc.metadata or {}
     meta_title = meta.get("title", "").strip()
     meta_author = meta.get("author", "").strip()
@@ -1558,41 +1608,35 @@ def extract_title_author(doc, pdf_path):
     if meta_author and len(meta_author) < 3:
         meta_author = ""
 
-    # Check for clear "Title by Author" pattern on title pages
+    # 1. Check for clear "Title by Author" pattern on title pages
     page_title, page_author = _extract_title_from_titlepage(doc)
     if page_title:
         title = page_title
         author = page_author or meta_author
         return title, author
 
-    # Fall back to metadata
-    if meta_title:
+    # 2. Parse filename — if it has "Author - Title" with a clear person name,
+    #    prefer it over PDF metadata (which is often garbage/swapped)
+    fn_title, fn_author = _parse_filename_title_author(pdf_path)
+    if fn_author and _looks_like_person_name(fn_author):
+        best_title = fn_title
+        if (meta_title and not _is_garbage_metadata(meta_title)
+                and len(meta_title) > len(fn_title)
+                and fn_title.lower() in meta_title.lower()):
+            best_title = meta_title
+        return best_title, fn_author
+
+    # 3. Use metadata if not garbage
+    if meta_title and not _is_garbage_metadata(meta_title):
+        if meta_author:
+            title_is_name = _looks_like_person_name(meta_title)
+            author_is_name = _looks_like_person_name(meta_author)
+            if title_is_name and not author_is_name:
+                return meta_author, meta_title
         return meta_title, meta_author
 
-    # Last resort: parse filename
-    basename = os.path.splitext(os.path.basename(pdf_path))[0]
-    clean_basename = re.sub(r"\{[^}]*\}", "", basename).strip()
-
-    if " - " in clean_basename:
-        parts = clean_basename.split(" - ")
-        if len(parts) == 2:
-            left, right = parts[0].strip(), parts[1].strip()
-        else:
-            left = parts[0].strip()
-            right = " - ".join(parts[1:]).strip()
-
-        left_is_name = _looks_like_person_name(left)
-        right_is_name = _looks_like_person_name(right)
-        if left_is_name and not right_is_name:
-            return right, left
-        elif right_is_name and not left_is_name:
-            return left, right
-        else:
-            if len(right) >= len(left):
-                return right, left
-            return left, right
-
-    return clean_basename, meta_author
+    # 4. Filename without author (no " - " separator)
+    return fn_title or meta_title or os.path.splitext(os.path.basename(pdf_path))[0], fn_author or meta_author
 
 # =============================================================================
 # SECTION 4: MASTER ORCHESTRATOR & BATCH LOGGING

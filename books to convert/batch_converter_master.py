@@ -41,6 +41,191 @@ except ImportError:
         except ImportError:
             import fitz
 
+
+# =============================================================================
+# FONT STYLE DETECTION (italic/bold) FOR BROKEN CID FONTS
+# =============================================================================
+
+def _detect_font_styles(doc):
+    """Build a font_name -> {'italic': bool, 'bold': bool} map.
+
+    For normal fonts, uses PyMuPDF's span flags.  For broken CID fonts
+    (Identity-H encoding, all flags identical), falls back to CFF glyph
+    outline slant analysis: italic fonts have tall glyphs leaning right.
+    """
+    import io as _io, re as _re, math as _math
+
+    # First pass: collect flags per font from a sample of pages
+    font_flags = {}  # font_name -> set of flag values seen
+    sample_pages = list(range(min(30, len(doc))))
+    for pn in sample_pages:
+        page = doc[pn]
+        d = page.get_text("dict", sort=True)
+        for block in d.get("blocks", []):
+            if block.get("type", 0) == 1:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    font = span["font"]
+                    flags = span["flags"]
+                    font_flags.setdefault(font, set()).add(flags)
+
+    # Check if flags are usable (different fonts have different flag values)
+    all_flag_sets = list(font_flags.values())
+    flag_values = set()
+    for fs in all_flag_sets:
+        flag_values.update(fs)
+
+    styles = {}
+    if len(flag_values) > 1:
+        # Flags are differentiated — use them directly
+        for font, fset in font_flags.items():
+            flags = max(fset)  # take the most common/representative
+            styles[font] = {
+                "italic": bool(flags & 2),
+                "bold": bool(flags & 16),
+            }
+        return styles
+
+    # All fonts have identical flags — broken metadata, need CFF slant fallback
+    try:
+        from fontTools.cffLib import CFFFontSet
+        from fontTools.pens.recordingPen import RecordingPen
+        from fontTools.pens.boundsPen import BoundsPen
+    except ImportError:
+        for font in font_flags:
+            styles[font] = {"italic": False, "bold": False}
+        return styles
+
+    # Build xref -> PyMuPDF font name mapping
+    xref_to_fonts = {}  # xref -> set of pymupdf font names
+    for pn in sample_pages:
+        page = doc[pn]
+        for f in page.get_fonts(full=True):
+            xref = f[0]
+            refname = f[4]  # the /Name used in content stream
+            xref_to_fonts.setdefault(xref, set())
+        # Also map from dict spans
+        d = page.get_text("dict", sort=True)
+        page_fonts = {f[4]: f[0] for f in page.get_fonts(full=True)}
+
+    # Map each font xref to its FontFile3 CFF stream
+    font_xref_done = set()
+    xref_to_pymupdf = {}
+    for pn in sample_pages:
+        page = doc[pn]
+        d = page.get_text("dict", sort=True)
+        font_info = page.get_fonts(full=True)
+        # Build refname -> xref mapping
+        refname_map = {f[4]: f[0] for f in font_info}
+        # Map PyMuPDF font names to xrefs via span font names
+        for block in d.get("blocks", []):
+            if block.get("type", 0) == 1:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    pymupdf_name = span["font"]
+                    # PyMuPDF uses the CFF font name directly
+                    for fi in font_info:
+                        fi_name = fi[3].split("-")[0]  # strip -Identity-H
+                        if fi_name == pymupdf_name:
+                            xref_to_pymupdf[fi[0]] = pymupdf_name
+                            break
+
+    for xref, pymupdf_name in xref_to_pymupdf.items():
+        if xref in font_xref_done or pymupdf_name in styles:
+            continue
+        font_xref_done.add(xref)
+        try:
+            font_obj = doc.xref_object(xref)
+            desc_match = _re.search(r'/DescendantFonts\s*\[\s*(\d+)\s+0\s+R', font_obj)
+            if not desc_match:
+                styles[pymupdf_name] = {"italic": False, "bold": False}
+                continue
+            desc_obj = doc.xref_object(int(desc_match.group(1)))
+            fd_match = _re.search(r'/FontDescriptor\s+(\d+)\s+0\s+R', desc_obj)
+            if not fd_match:
+                styles[pymupdf_name] = {"italic": False, "bold": False}
+                continue
+            fd_obj = doc.xref_object(int(fd_match.group(1)))
+            ff3_match = _re.search(r'/FontFile3\s+(\d+)\s+0\s+R', fd_obj)
+            if not ff3_match:
+                styles[pymupdf_name] = {"italic": False, "bold": False}
+                continue
+            ff3_xref = int(ff3_match.group(1))
+            stream = doc.xref_stream(ff3_xref)
+
+            cff = CFFFontSet()
+            cff.decompile(_io.BytesIO(stream), otFont=None)
+            top = cff.topDictIndex[0]
+            cs = top.CharStrings
+
+            # Check CFF ItalicAngle first
+            cff_italic_angle = getattr(top, 'ItalicAngle', 0)
+            if cff_italic_angle != 0:
+                styles[pymupdf_name] = {
+                    "italic": True,
+                    "bold": False,
+                }
+                continue
+
+            # Compute slant from single-character glyph outlines
+            slants = []
+            for i, gname in enumerate(cs.keys()):
+                if i > 50:
+                    break
+                bp = BoundsPen(None)
+                try:
+                    cs[gname].draw(bp)
+                except Exception:
+                    continue
+                bounds = bp.bounds
+                if not bounds:
+                    continue
+                x0, y0, x1, y1 = bounds
+                h = y1 - y0
+                w = x1 - x0
+                if h < 300 or w / h > 1.2:
+                    continue
+                rp = RecordingPen()
+                cs[gname].draw(rp)
+                points = []
+                for op, args in rp.value:
+                    if op == 'moveTo':
+                        points.append(args[0])
+                    elif op == 'lineTo':
+                        points.append(args[0])
+                    elif op == 'curveTo':
+                        points.extend(args)
+                if len(points) < 4:
+                    continue
+                mid_y = (y0 + y1) / 2
+                top_xs = [p[0] for p in points if p[1] > mid_y]
+                bot_xs = [p[0] for p in points if p[1] <= mid_y]
+                if top_xs and bot_xs:
+                    slant_ratio = (sum(top_xs)/len(top_xs) - sum(bot_xs)/len(bot_xs)) / h
+                    slants.append(_math.degrees(_math.atan(slant_ratio)))
+
+            if len(slants) >= 5:
+                import statistics as _stats
+                median_slant = _stats.median(slants)
+                is_italic = abs(median_slant) > 4.0
+            else:
+                is_italic = False
+
+            styles[pymupdf_name] = {"italic": is_italic, "bold": False}
+
+        except Exception:
+            styles[pymupdf_name] = {"italic": False, "bold": False}
+
+    # Fill in any fonts not yet mapped
+    for font in font_flags:
+        if font not in styles:
+            styles[font] = {"italic": False, "bold": False}
+
+    return styles
+
+
 # =============================================================================
 # SECTION 1: PDF TRIAGE ENGINE
 # =============================================================================
@@ -331,6 +516,12 @@ def _fix_th_ligature(text):
     return text
 
 
+_ILLEGAL_XML_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+def strip_control_chars(text):
+    """Remove control characters illegal in XML (keeps tab, newline, carriage return)."""
+    return _ILLEGAL_XML_CHARS.sub('', text)
+
 def normalize_ligatures(text, fix_th=False):
     """Decompose Unicode ligatures (ﬀ→ff, ﬁ→fi, etc.) and optionally fix Th ligature."""
     text = unicodedata.normalize("NFKC", text)
@@ -385,6 +576,149 @@ def collapse_spaced_text(text):
             merged.append(w)
             i += 1
     return ' '.join(merged)
+
+
+# =============================================================================
+# GARBLED CID FONT TEXT REPAIR
+# =============================================================================
+# Some PDFs (especially those produced by older publishing tools) have Type0/CID
+# fonts with Identity-H encoding and broken ToUnicode maps.  The font glyphs are
+# correct, but the character mapping extracts wrong Unicode code points.  Common
+# symptoms: Å or Æ replacing ligature glyphs ("it"/"at"), ! or ' inserted mid-word,
+# lowercase-L or digits replacing capital letters.  The garbling is inconsistent
+# across pages because the font is re-subsetted per page with different CID
+# assignments.
+#
+# Strategy: detect the garbling pattern and apply targeted regex corrections
+# AFTER span merging so the full garbled text is in one string.
+
+_GARBLED_CHAR_CLASS = r"[!'\x01\dA-Za-zÀ-ÿ\x99™ɦ#]"
+_GARBLED_INFINITE_RE = re.compile(
+    r"(?<![a-zA-ZÀ-ÿ])"   # not preceded by a letter
+    r"("
+    r"[!'\x01\d]*"                   # optional leading !, ', or digits
+    r"[IilhbÅ1!]"                   # first real letter (I/l/h/b/Å/1/!)
+    + _GARBLED_CHAR_CLASS + r"*?"    # middle characters (non-greedy)
+    r"[fj]"                          # 'f' is always preserved (rarely garbled to 'j')
+    + _GARBLED_CHAR_CLASS + r"*?"    # more middle characters
+    r")"
+    r"(?=\s*Jes[t!])"               # followed by "Jest" or "Jes!s"
+)
+
+_GARBLED_JEST_JOINED_RE = re.compile(
+    r"(?<![a-zA-ZÀ-ÿ])"
+    r"[!'\x01\d]*[IilhbÅ1!]" + _GARBLED_CHAR_CLASS + r"*?[fj]"
+    + _GARBLED_CHAR_CLASS + r"*?"
+    r"Jes[t!][a-z]*"                # "Jestis" → "Jest is", "Jestas" → "Jest as"
+    r"(?=[,.\s!;:]|$)"
+)
+
+_GARBLED_INDICATORS = re.compile(
+    r"[ÅÆ](?=[a-z])"          # Å or Æ before a lowercase letter (broken ligature)
+    r"|(?<=[a-z])[ÅÆ]"        # Å or Æ after a lowercase letter
+    r"|!'!"                    # !'! pattern (garbled "Inf")
+    r"|!t!f"                   # !t!f pattern
+    r"|!Jif"                   # !Jif pattern
+    r"|Q!J"                    # Q!J → Qu
+)
+
+
+def _detect_garbled_cid_text(pages_spans):
+    """Check if document has garbled text from broken CID font encoding."""
+    indicator_count = 0
+    for spans in pages_spans:
+        for s in spans:
+            if s.get("is_image"):
+                continue
+            text = s.get("text", "")
+            indicator_count += len(_GARBLED_INDICATORS.findall(text))
+    return indicator_count >= 3
+
+
+def _fix_garbled_cid_text(text):
+    """Fix garbled text from PDFs with broken CID font ToUnicode maps."""
+
+    # --- Pass 1: Fix garbled "Infinite" before "Jest" ---
+    def _replace_infinite(m):
+        return "Infinite"
+
+    text = _GARBLED_INFINITE_RE.sub(_replace_infinite, text)
+
+    # --- Pass 2: Fix joined "InfiniteJestXX" patterns ---
+    # e.g. "InfimÅeJestis," → "Infinite Jest is,"
+    def _split_jest_joined(m):
+        full = m.group(0)
+        # After pass 1, the "Infinite" part should already be fixed
+        # but handle any remaining joined patterns
+        idx = full.find("Jest")
+        if idx < 0:
+            idx = full.find("Jes!")
+        if idx < 0:
+            return full
+        before = full[:idx]
+        after = full[idx + 4:]  # text after "Jest"
+        # Fix the prefix to "Infinite" if it's garbled
+        if before != "Infinite":
+            before = "Infinite"
+        result = before + " Jest"
+        if after:
+            result += " " + after
+        return result
+
+    text = _GARBLED_JEST_JOINED_RE.sub(_split_jest_joined, text)
+
+    # --- Pass 3: Fix "Qu" garbling (Q!J → Qu) ---
+    text = re.sub(r'Q!J', 'Qu', text)
+
+    # --- Pass 4: Fix INFINITE !EsT → INFINITE JEST (uppercase garbling) ---
+    text = re.sub(r'\bINFINITE\s+!EsT\b', 'INFINITE JEST', text)
+
+    # --- Pass 5: Fix "ofits" → "of its" (space lost in span merging) ---
+    text = re.sub(r'\bofits\b', 'of its', text)
+
+    # --- Pass 6: Fix [szc] → [sic] (z→i garbling) ---
+    text = text.replace('[szc]', '[sic]')
+
+    # --- Pass 7: Targeted word-level fixes (safe, no accented-char risk) ---
+    text = re.sub(r'\bWzthout\b', 'Without', text)
+    text = re.sub(r'\breQuire\b', 'require', text)
+    text = re.sub(r'fY', 'fy', text)
+    text = re.sub(r'\bSortcover\b', 'Softcover', text)
+    text = re.sub(r'\bDowLING\b', 'DOWLING', text)
+    text = re.sub(r'\bRo1lents\b', 'Rollents', text)
+    text = re.sub(r'\bnlVhat\b', '"What', text)
+    text = re.sub(r'\bnmTatt"ve\b', 'narrative', text)
+    text = re.sub(r'\bFmnz\b', 'Franz', text)
+    text = re.sub(r'\btmnsfonned\b', 'transformed', text)
+    text = re.sub(r'\bTechniQues\b', 'Techniques', text)
+    text = re.sub(r"Electn['\x01]c", 'Electric', text)
+    text = re.sub(r'\b17zeater\b', 'Theater', text)
+    text = re.sub(r'\b17ze\b', 'The', text)
+    text = re.sub(r'\b17ze(?=[A-Z])', 'The ', text)
+    text = re.sub(r"TO['\x01]WTI", 'Town', text)
+    text = re.sub(r'Bedtime \.for\b', 'Bedtime for', text)
+    text = re.sub(r'\bStory if a\b', 'Story of a', text)
+    text = re.sub(r'\bFauteur7s\b', 'Fauteuils', text)
+    text = re.sub(r'\bconsc1ousness\b', 'consciousness', text)
+    text = re.sub(r'\blOrker\b', 'Yorker', text)
+    text = re.sub(r'\bPnnciples\b', 'Principles', text)
+    text = re.sub(r'\bFonner\b', 'Former', text)
+    text = re.sub(r'\bbgimXe Jest\b', 'Infinite Jest', text)
+    text = re.sub(r"!'\!\[mite Jest", 'Infinite Jest', text)
+
+    # --- Pass 8: Garbled J → ) or ], and missing spaces around JOI ---
+    text = re.sub(r'\) ames\b', 'James', text)
+    text = re.sub(r'Jestas\]OI\b', 'Jest as JOI', text)
+    text = re.sub(r'\basJOI\b', 'as JOI', text)
+    text = re.sub(r'\]OI\b', 'JOI', text)
+    text = re.sub(r'Jest,\]OI\b', 'Jest, JOI', text)
+
+    # --- Pass 9: Fix Å/Æ ligature artifacts (broken CMap multi-char expansions) ---
+    text = re.sub(r'\btemÅory\b', 'territory', text)
+
+    return text
+
+
 
 
 def _detect_tables_in_page(spans):
@@ -541,6 +875,7 @@ def extract_spans(doc, pdf_path):
         os.makedirs(img_dir)
 
     img_counter = 0
+    font_styles = _detect_font_styles(doc)
 
     for page_num in range(len(doc)):
         page = doc[page_num]
@@ -597,13 +932,18 @@ def extract_spans(doc, pdf_path):
                             continue
                         bbox = span["bbox"]
                         sz = round(span.get("size", 0), 1)
+                        font = span.get("font", "")
+                        flags = span.get("flags", 0)
+                        fs = font_styles.get(font, {})
+                        span_italic = fs.get("italic", bool(flags & 2))
+                        span_bold = fs.get("bold", bool(flags & 16))
                         if merged_line_spans:
                             prev = merged_line_spans[-1]
+                            same_style = (prev["italic"] == span_italic and
+                                          prev["bold"] == span_bold)
                             gap = bbox[0] - prev["x1"]
                             avg_sz = (prev["size"] + sz) / 2
-                            if gap < avg_sz * 0.6:
-                                # gap > ~15% of font size = word spacing → add space
-                                # gap ≤ ~15% = character-level merge (no space)
+                            if same_style and gap < avg_sz * 0.6:
                                 if gap > avg_sz * 0.15:
                                     prev["text"] += " " + text
                                 else:
@@ -618,6 +958,8 @@ def extract_spans(doc, pdf_path):
                             "x1": bbox[2],
                             "y0": bbox[1],
                             "y1": bbox[3],
+                            "italic": span_italic,
+                            "bold": span_bold,
                         })
                     for ms in merged_line_spans:
                         spans.append({
@@ -625,8 +967,11 @@ def extract_spans(doc, pdf_path):
                             "text": ms["text"],
                             "size": ms["size"],
                             "x0": ms["x0"],
+                            "x1": ms["x1"],
                             "y0": ms["y0"],
                             "y1": ms["y1"],
+                            "italic": ms["italic"],
+                            "bold": ms["bold"],
                             "page_height": h,
                             "new_block": first_span_in_block,
                         })
@@ -1005,6 +1350,13 @@ def build_html_layout(pages_spans, header_set, footer_set, heading_map, footnote
                         continue
 
             escaped = html_module.escape(norm)
+            # Wrap in inline formatting tags
+            is_italic = s.get("italic", False)
+            is_bold = s.get("bold", False)
+            if is_bold:
+                escaped = "<strong>" + escaped + "</strong>"
+            if is_italic:
+                escaped = "<em>" + escaped + "</em>"
 
             if s.get("new_block", False) and cur_para:
                 parts.append("<p>" + strip_marginal_markers(" ".join(cur_para)) + "</p>")
@@ -1058,6 +1410,21 @@ def build_html_layout(pages_spans, header_set, footer_set, heading_map, footnote
             parts.append(f"<p class='footnote'>{fn}</p>")
     parts.append("</body></html>")
     html_text = "\n".join(parts)
+    # Post-process: merge adjacent identical inline formatting tags
+    # e.g. <em>word1</em> <em>word2</em> → <em>word1 word2</em>
+    for _tag in ('em', 'strong'):
+        html_text = re.sub(
+            r'</' + _tag + r'>(\s+)<' + _tag + r'>',
+            r'\1',
+            html_text,
+        )
+    # Post-process: fix garbled "Infinite Jest" split across <em> boundaries
+    # e.g. <em>IrifimÅe Je</em> sts → <em>Infinite Jest</em>'s
+    html_text = re.sub(
+        r'<em>' + _GARBLED_CHAR_CLASS + r'+Åe\s+Je</em>\s*st(?:s\b)?',
+        r"<em>Infinite Jest</em>'s",
+        html_text,
+    )
     # Post-process: merge paragraphs split at hyphens (word-wrap artifacts)
     html_text = re.sub(
         r"(\w)[\-­]\s*</p>\n<p>([a-z])",
@@ -1117,14 +1484,61 @@ def _looks_like_person_name(text):
     # Parenthetical content suggests a title, not a name
     if "(" in text:
         return False
-    # Single well-known author names
-    if len(words) == 1 and words[0][0].isupper():
-        return True
+    # Single word: only a name if mixed case (not ALL-CAPS or all-lower)
+    if len(words) == 1:
+        w = words[0]
+        return len(w) >= 2 and w[0].isupper() and not w.isupper()
     # 2-4 capitalized words with no function words = likely a name
+    # Allow lowercase middle words for names with particles (van, de, chul, bin, etc.)
     if len(words) >= 2:
         capitalized = sum(1 for w in words if w[0].isupper())
-        return capitalized >= len(words) * 0.7
+        if capitalized >= len(words) * 0.7:
+            return True
+        if len(words) == 3 and words[0][0].isupper() and words[2][0].isupper():
+            return True
     return False
+
+
+def _is_garbage_metadata(text):
+    """Check if a metadata string looks like tool/conversion artifacts."""
+    if not text:
+        return True
+    low = text.lower()
+    garbage_patterns = [
+        "converted with", "microsoft word", "www.", ".doc", ".docx",
+        "acropad", "acrobat", "pdfcreator", "calibre", "libgen",
+        "http:", "https:", "freeware", "scanner", "ocr",
+    ]
+    return any(p in low for p in garbage_patterns)
+
+
+def _parse_filename_title_author(pdf_path):
+    """Parse 'Author - Title' or 'Title - Author' from filename."""
+    basename = os.path.splitext(os.path.basename(pdf_path))[0]
+    clean_basename = re.sub(r"\{[^}]*\}", "", basename).strip()
+    clean_basename = re.sub(r'-pdfread$', '', clean_basename).strip()
+
+    if " - " in clean_basename:
+        parts = clean_basename.split(" - ")
+        if len(parts) == 2:
+            left, right = parts[0].strip(), parts[1].strip()
+        else:
+            left = parts[0].strip()
+            right = " - ".join(parts[1:]).strip()
+
+        left_clean = re.sub(r'\s*\([^)]*\)\s*$', '', left).strip()
+        right_clean = re.sub(r'\s*\([^)]*\)\s*$', '', right).strip()
+
+        left_is_name = _looks_like_person_name(left_clean)
+        right_is_name = _looks_like_person_name(right_clean)
+        if left_is_name and not right_is_name:
+            return right_clean, left_clean
+        elif right_is_name and not left_is_name:
+            return left_clean, right_clean
+        else:
+            return right_clean, left_clean
+
+    return clean_basename, ""
 
 
 def _extract_title_from_titlepage(doc):
@@ -1181,7 +1595,10 @@ def _extract_title_from_titlepage(doc):
 
 
 def extract_title_author(doc, pdf_path):
-    """Extract title and author from metadata, title-page text, or filename."""
+    """Extract title and author from metadata, title-page text, or filename.
+    Priority: (1) title-page "by" pattern, (2) filename with clear author-title
+    split, (3) PDF metadata, (4) filename without author detection.
+    """
     meta = doc.metadata or {}
     meta_title = meta.get("title", "").strip()
     meta_author = meta.get("author", "").strip()
@@ -1191,41 +1608,35 @@ def extract_title_author(doc, pdf_path):
     if meta_author and len(meta_author) < 3:
         meta_author = ""
 
-    # Check for clear "Title by Author" pattern on title pages
+    # 1. Check for clear "Title by Author" pattern on title pages
     page_title, page_author = _extract_title_from_titlepage(doc)
     if page_title:
         title = page_title
         author = page_author or meta_author
         return title, author
 
-    # Fall back to metadata
-    if meta_title:
+    # 2. Parse filename — if it has "Author - Title" with a clear person name,
+    #    prefer it over PDF metadata (which is often garbage/swapped)
+    fn_title, fn_author = _parse_filename_title_author(pdf_path)
+    if fn_author and _looks_like_person_name(fn_author):
+        best_title = fn_title
+        if (meta_title and not _is_garbage_metadata(meta_title)
+                and len(meta_title) > len(fn_title)
+                and fn_title.lower() in meta_title.lower()):
+            best_title = meta_title
+        return best_title, fn_author
+
+    # 3. Use metadata if not garbage
+    if meta_title and not _is_garbage_metadata(meta_title):
+        if meta_author:
+            title_is_name = _looks_like_person_name(meta_title)
+            author_is_name = _looks_like_person_name(meta_author)
+            if title_is_name and not author_is_name:
+                return meta_author, meta_title
         return meta_title, meta_author
 
-    # Last resort: parse filename
-    basename = os.path.splitext(os.path.basename(pdf_path))[0]
-    clean_basename = re.sub(r"\{[^}]*\}", "", basename).strip()
-
-    if " - " in clean_basename:
-        parts = clean_basename.split(" - ")
-        if len(parts) == 2:
-            left, right = parts[0].strip(), parts[1].strip()
-        else:
-            left = parts[0].strip()
-            right = " - ".join(parts[1:]).strip()
-
-        left_is_name = _looks_like_person_name(left)
-        right_is_name = _looks_like_person_name(right)
-        if left_is_name and not right_is_name:
-            return right, left
-        elif right_is_name and not left_is_name:
-            return left, right
-        else:
-            if len(right) >= len(left):
-                return right, left
-            return left, right
-
-    return clean_basename, meta_author
+    # 4. Filename without author (no " - " separator)
+    return fn_title or meta_title or os.path.splitext(os.path.basename(pdf_path))[0], fn_author or meta_author
 
 # =============================================================================
 # SECTION 4: MASTER ORCHESTRATOR & BATCH LOGGING
@@ -1270,11 +1681,17 @@ def process_file(pdf_path, output_dir=None):
             fix_th = _detect_th_ligature_issue(pages_spans)
             if fix_th:
                 print("  Detected Th-ligature issue — applying fix")
+            fix_garbled = _detect_garbled_cid_text(pages_spans)
+            if fix_garbled:
+                print("  Detected garbled CID font encoding — applying repair")
             for page_spans in pages_spans:
                 for s in page_spans:
                     if not s.get("is_image") and "text" in s:
                         s["text"] = normalize_ligatures(s["text"], fix_th=fix_th)
                         s["text"] = collapse_spaced_text(s["text"])
+                        s["text"] = strip_control_chars(s["text"])
+                        if fix_garbled:
+                            s["text"] = _fix_garbled_cid_text(s["text"])
 
             # Detect and format tabular regions before building HTML
             table_count = 0
@@ -1292,6 +1709,16 @@ def process_file(pdf_path, output_dir=None):
             print(f"  Body size: {body_size}, Headings: {heading_map}")
             print(f"  Filtered headers: {header_set}")
             html = build_html_layout(pages_spans, header_set, footer_set, heading_map, body_size - 1.0)
+
+            # Second pass: fix garbled text that spans across font boundaries
+            # (first pass at span level can miss cases where garbled text and "Jest"
+            # are in separate spans from different fonts)
+            if fix_garbled:
+                # HTML-encode-aware fix: temporarily decode &#x27; so the regex
+                # can match apostrophes in garbled patterns like I'!fimîe
+                html = html.replace("&#x27;", "\x01")
+                html = _fix_garbled_cid_text(html)
+                html = html.replace("\x01", "&#x27;")
 
             # Linkify printed TOC pages: match paragraphs to actual chapter headings
             heading_slugs = {_slugify(m.group(1)) for m in re.finditer(r"<h[12]>([^<]+)</h[12]>", html)}
