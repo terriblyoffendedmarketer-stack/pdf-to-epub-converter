@@ -1,9 +1,9 @@
 # PDF to EPUB Converter
 
 ## Status
-**Phase:** Core converter hardened and battle-tested across 25 PDFs.
-**Current:** 20 PASS, 5 WARN, 0 FAIL across all 25 test PDFs. WARNs are: missing author (2), minor PDF-source character spacing (2), low heading count (1). All books fully readable.
-**Next:** Web portal (FastAPI-based upload/convert/download interface).
+**Phase:** Core converter hardened and battle-tested across 36 PDFs (25 original + 11 Google Drive test set).
+**Current:** 8 PASS, 4 WARN, 0 FAIL on the 12-book test set. WARNs: low heading count (1), mid-sentence breaks (1), fused words from CID font (1), missing author (1). All books fully readable.
+**Next:** Further edge-case hardening as new PDFs are tested.
 
 ## Roadmap
 - [x] PDF triage engine (scanned vs text vs complex)
@@ -32,10 +32,18 @@
 - [x] Battle-tested on 25 diverse PDFs (20 PASS, 5 WARN, 0 FAIL)
 - [x] Garbled CID font repair (broken Type0/Identity-H ToUnicode maps)
 - [x] Web portal for upload/convert/download
+- [x] Title/author extraction overhaul (4-tier: title-page > filename > metadata > fallback; garbage metadata filtering; particle name support)
+- [x] Enhanced audit (formatting tags, CID artifacts, empty chapters, fused words)
+- [x] Dot-leader paragraph break preservation (TOC entries stay on separate lines)
+- [x] Enumerated list item preservation (`(N)` patterns as separate paragraphs)
+- [x] False table detection fix (mixed-font inline text no longer misidentified as tables)
+- [x] Conversion-time quality warnings (length-aware thresholds, no false positives on short stories)
 
 ## File Map
 - `PDF to EPUB converter.py` — Main converter script. Run with: `python3 "PDF to EPUB converter.py" <dir-or-file> [-y] [-o output_dir]`
-- `audit_epubs.py` — EPUB quality audit. Checks: title, author, cover, TOC, headings, images, mid-sentence breaks, page numbers, ligatures
+- `audit_epubs.py` — EPUB quality audit. Checks: title, author, cover, TOC, headings, images, mid-sentence breaks, page numbers, ligatures, formatting tags, CID artifacts, empty chapters, fused words
+- `test_pdfs/` — 11 test PDFs downloaded from Google Drive (gitignored)
+- `test_output/` — Converted EPUBs from test PDFs (gitignored)
 - `ERRORS_AND_FIXES.md` — Detailed log of every major bug, what caused it, what didn't work, and what fixed it. Essential reading for future iterations.
 - `books to convert/` — Source PDFs, intermediate HTML, extracted images, and generated EPUBs
 - `books to convert/batch_converter_master.py` — Copy of main converter (kept in sync)
@@ -51,7 +59,7 @@
 5. Audit: `books to convert/pdf_env/bin/python3 audit_epubs.py "Processed PDFs to EPUB"`
 
 ## Known Quirks
-- Title extraction priority: page-0 "Title by Author" pattern -> PDF metadata (never filename)
+- Title extraction priority: (1) title-page "by" pattern, (2) filename "Author - Title" with person-name detection, (3) PDF metadata with garbage filtering, (4) filename fallback
 - Spaced-out text: converter collapses pure single-letter runs and small-caps fragments; residual cases (e.g., "o f" for "of") are PDF-source encoding artifacts, flagged as WARN
 - "Discon nected" in Chuck Palahniuk — PDF stores the word with a space; not a ligature issue
 - Scanned PDFs are detected and skipped (no OCR engine integrated)
