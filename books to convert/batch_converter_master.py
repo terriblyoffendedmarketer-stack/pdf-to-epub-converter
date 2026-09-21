@@ -962,6 +962,10 @@ def extract_spans(doc, pdf_path):
                             "bold": span_bold,
                         })
                     for ms in merged_line_spans:
+                        # Lines starting with enumeration patterns are list items —
+                        # treat as new blocks even within the same PDF block
+                        line_text = ms["text"].strip()
+                        is_list_item = bool(re.match(r'^\(\d+\)\s', line_text))
                         spans.append({
                             "is_image": False,
                             "text": ms["text"],
@@ -973,7 +977,7 @@ def extract_spans(doc, pdf_path):
                             "italic": ms["italic"],
                             "bold": ms["bold"],
                             "page_height": h,
-                            "new_block": first_span_in_block,
+                            "new_block": first_span_in_block or is_list_item,
                         })
                         first_span_in_block = False
 
@@ -1185,7 +1189,11 @@ def _fix_paragraph_breaks(pages_spans, heading_sizes, header_set=None, footer_se
                 gap = s["y0"] - prev_y1
                 is_indented = x0 > dominant_x0 + indent_threshold
                 has_large_gap = gap > gap_threshold
-                if not is_indented and not has_large_gap and not prev_has_dots:
+                # Preserve block break after dot-leader lines (TOC entries)
+                # and before enumerated list items like (1), (2), 1., 2.
+                cur_text = s.get("text", "").strip()
+                starts_enum = bool(re.match(r'^\(\d+\)\s', cur_text))
+                if not is_indented and not has_large_gap and not prev_has_dots and not starts_enum:
                     s["new_block"] = False
             after_heading_or_image = False
             prev_y1 = s["y1"]
